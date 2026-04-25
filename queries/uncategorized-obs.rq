@@ -1,0 +1,13 @@
+PREFIX : <urn:alhidad:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?path ?label (COUNT(?asset) AS ?files) WHERE {
+  ?asset a :Data ;
+    :directory ?dir .
+  ?dir rdfs:label "obs" ;
+        :path ?path .
+  FILTER NOT EXISTS { ?dir :category ?cat }
+}
+GROUP BY ?path ?label
+ORDER BY DESC(?files)

@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0
+# Transcribe and diarize a single media file.
+# Usage: transcribe-one <input> <output.txt> [model]
+#
+# Pipeline: ffmpeg -> silence detect -> chunk -> whisper SRT -> diarize -> fountain
+# Resumable: intermediate files stored alongside output as .work/
+set -euo pipefail
+
+ALHIDAD="$(cd "$(dirname "$0")/../.." && pwd)"
+INPUT="$1"
+OUTPUT="$2"
+MODEL="${3:-$HOME/whisper.cpp/models/ggml-large-v3-turbo.bin}"
+WHISPER="${4:-$HOME/whisper.cpp/build/bin/whisper-cli}"
+
+# Work directory persists alongside output for resume
+WORKDIR="${OUTPUT%.txt}.work"
+mkdir -p "$WORKDIR"
+
+echo "  transcribing: $INPUT" >&2
+
+# Step 1: Convert to 16kHz mono WAV (skip if exists)
+AUDIO="$WORKDIR/audio.wav"
+if [ ! -f "$AUDIO" ]; then
+    echo "  extracting audio..." >&2
+    if ! ffmpeg -y -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$AUDIO" 2>/dev/null; then
+        echo "  SKIP: ffmpeg failed on $INPUT (corrupt file?)" >&2
+        rm -rf "$WORKDIR"
+        mkdir -p "$(dirname "$OUTPUT")"
+        echo "CORRUPTED" > "$OUTPUT"
+        exit 0
+    fi
+else
+    echo "  audio.wav exists, skipping extraction" >&2
+fi
+
+# Step 2: Detect silence and compute segments (skip if exists)
+SEGMENTS="$WORKDIR/segments.txt"
+if [ ! -f "$SEGMENTS" ]; then
+    echo "  detecting speech segments..." >&2
+    SILENCE="$WORKDIR/silence.txt"
+    ffmpeg -i "$AUDIO" -af "silencedetect=noise=-30dB:d=3" -f null - 2>&1 \
+        | grep -E "silence_(start|end)" > "$SILENCE" || true
+
+    python3 - "$SILENCE" "$AUDIO" "$SEGMENTS" <<'PYEOF'
+import sys, subprocess, re
+
+silence_file = sys.argv[1]
+audio_file = sys.argv[2]
+segments_file = sys.argv[3]
+
+MIN_GAP = 10
+MAX_CHUNK = 600
+
+probe = subprocess.run(
+    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+     "-of", "default=noprint_wrappers=1:nokey=1", audio_file],
+    capture_output=True, text=True)
+total_dur = float(probe.stdout.strip())
+
+silences = []
+current_start = None
+with open(silence_file) as f:
+    for line in f:
+        m = re.search(r'silence_start: (\S+)', line)
+        if m:
+            current_start = float(m.group(1))
+        m = re.search(r'silence_end: (\S+)', line)
+        if m and current_start is not None:
+            silences.append((current_start, float(m.group(1))))
+            current_start = None
+
+speech = []
+pos = 0.0
+for s_start, s_end in silences:
+    if s_start > pos + 0.1:
+        speech.append((pos, s_start))
+    pos = s_end
+if pos < total_dur - 0.1:
+    speech.append((pos, total_dur))
+
+if not speech:
+    speech = [(0.0, total_dur)]
+
+chunks = []
+cur_start, cur_end = speech[0]
+for start, end in speech[1:]:
+    gap = start - cur_end
+    if gap < MIN_GAP and (end - cur_start) < MAX_CHUNK:
+        cur_end = end
+    else:
+        chunks.append((cur_start, cur_end))
+        cur_start, cur_end = start, end
+chunks.append((cur_start, cur_end))
+
+speech_dur = sum(e - s for s, e in chunks)
+print(f"  {len(chunks)} chunks, {speech_dur:.0f}s speech / {total_dur:.0f}s total", file=sys.stderr)
+
+with open(segments_file, 'w') as f:
+    for start, end in chunks:
+        f.write(f"{start:.3f} {end:.3f}\n")
+PYEOF
+else
+    echo "  segments.txt exists, skipping detection" >&2
+fi
+
+# Step 3: Transcribe each chunk (resume from last completed)
+COMBINED_SRT="$WORKDIR/combined.srt"
+DONE_MARKER="$WORKDIR/done_chunks"
+touch "$DONE_MARKER"
+DONE_COUNT=$(wc -l < "$DONE_MARKER")
+SEG_TOTAL=$(wc -l < "$SEGMENTS")
+
+if [ "$DONE_COUNT" -lt "$SEG_TOTAL" ]; then
+    SEG_NUM=0
+    while read -r SEG_START SEG_END; do
+        SEG_NUM=$((SEG_NUM + 1))
+
+        # Skip already completed chunks
+        if [ "$SEG_NUM" -le "$DONE_COUNT" ]; then
+            continue
+        fi
+
+        SEG_DUR=$(python3 -c "print(f'{$SEG_END - $SEG_START:.3f}')")
+        echo "  chunk $SEG_NUM/$SEG_TOTAL (${SEG_DUR}s at ${SEG_START}s)" >&2
+
+        # Extract chunk
+        SEG_AUDIO="$WORKDIR/seg.wav"
+        ffmpeg -y -i "$AUDIO" -ss "$SEG_START" -t "$SEG_DUR" -c:a pcm_s16le "$SEG_AUDIO" 2>/dev/null
+
+        # Transcribe chunk to SRT
+        SEG_BASE="$WORKDIR/seg_out"
+        "$WHISPER" \
+            -m "$MODEL" \
+            -l auto \
+            --output-srt \
+            --output-file "$SEG_BASE" \
+            -f "$SEG_AUDIO" 2>/dev/null || true
+
+        # Offset SRT timestamps and append to combined
+        if [ -f "${SEG_BASE}.srt" ]; then
+            python3 - "$SEG_START" "${SEG_BASE}.srt" >> "$COMBINED_SRT" <<'PYEOF2'
+import sys, re
+
+offset = float(sys.argv[1])
+srt_file = sys.argv[2]
+
+def offset_ts(match):
+    h, m, s, ms = int(match[1]), int(match[2]), int(match[3]), int(match[4])
+    total_ms = (h * 3600 + m * 60 + s) * 1000 + ms + int(offset * 1000)
+    h2 = total_ms // 3600000
+    m2 = (total_ms % 3600000) // 60000
+    s2 = (total_ms % 60000) // 1000
+    ms2 = total_ms % 1000
+    return f"{h2:02d}:{m2:02d}:{s2:02d},{ms2:03d}"
+
+with open(srt_file) as f:
+    content = f.read()
+
+content = re.sub(r"(\d+):(\d+):(\d+),(\d+)", offset_ts, content)
+print(content)
+PYEOF2
+            rm -f "${SEG_BASE}.srt"
+        fi
+
+        # Mark chunk done
+        echo "$SEG_NUM" >> "$DONE_MARKER"
+
+    done < "$SEGMENTS"
+else
+    echo "  all $SEG_TOTAL chunks already transcribed" >&2
+fi
+
+# Step 4+5: Renumber and diarize (only if whisper produced output)
+if [ ! -f "$COMBINED_SRT" ] || [ ! -s "$COMBINED_SRT" ]; then
+    echo "  SKIP: no SRT output (whisper produced nothing for any chunk)" >&2
+    rm -rf "$WORKDIR"
+    mkdir -p "$(dirname "$OUTPUT")"
+    echo "NO_SPEECH" > "$OUTPUT"
+    echo "  -> $OUTPUT"
+    exit 0
+fi
+
+# Renumber SRT entries sequentially
+python3 -c "
+import re
+with open('$COMBINED_SRT') as f:
+    content = f.read()
+idx = 1
+def renumber(m):
+    global idx
+    val = str(idx); idx += 1; return val
+content = re.sub(r'^\d+$', renumber, content, flags=re.MULTILINE)
+with open('$COMBINED_SRT', 'w') as f:
+    f.write(content)
+"
+
+# Diarize
+echo "  diarizing..." >&2
+mkdir -p "$(dirname "$OUTPUT")"
+python3 "$ALHIDAD/scripts/scribe/diarize" "$AUDIO" "$COMBINED_SRT" "$OUTPUT"
+
+# Clean up work directory on success
+rm -rf "$WORKDIR"
+
+echo "  -> $OUTPUT"

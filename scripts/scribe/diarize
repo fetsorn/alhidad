@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0
+"""Diarize an audio file using speechbrain speaker embeddings.
+
+Takes a whisper SRT file + audio, clusters speakers, outputs fountain format.
+
+Usage: bin/diarize <audio.wav> <input.srt> <output.txt>
+"""
+
+import re
+import sys
+import numpy as np
+from pathlib import Path
+
+import torch
+import torchaudio
+import librosa
+from speechbrain.inference.speaker import EncoderClassifier
+from sklearn.cluster import AgglomerativeClustering
+
+
+def parse_srt(path):
+    """Parse SRT file into list of (start_sec, end_sec, text) tuples."""
+    segments = []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    blocks = re.split(r"\n\n+", content.strip())
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 3:
+            continue
+        # Line 2: timestamp "00:01:23,456 --> 00:01:25,789"
+        m = re.match(
+            r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)",
+            lines[1],
+        )
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        text = " ".join(lines[2:]).strip()
+        if text:
+            segments.append((start, end, text))
+
+    return segments
+
+
+def extract_embeddings(audio_path, segments, classifier):
+    """Extract speaker embedding for each segment."""
+    # torchcodec fails with libnppicc.so.13 no such file
+    #signal, sr = torchaudio.load(audio_path, backend="sox")
+    data, sr = librosa.load(audio_path)
+    signal = torch.from_numpy(data)
+
+    if signal.ndim == 1:
+        signal = signal.unsqueeze(0) # Becomes [1, samples]
+    else:
+        signal = signal.t() # If already 2D, ensure it's [channels, samples]
+
+    if sr != 16000:
+        #signal = torchaudio.functional.resample(signal, sr, 16000)
+        signal = librosa.resample(signal.numpy(), orig_sr=sr, target_sr=16000)
+        signal = torch.from_numpy(signal)
+        if signal.ndim == 1:
+            signal = signal.unsqueeze(0)
+        sr = 16000
+    # Mono
+    if signal.shape[0] > 1:
+        signal = signal.mean(dim=0, keepdim=True)
+
+    embeddings = []
+    for start, end, _text in segments:
+        s = int(start * sr)
+        e = int(end * sr)
+        chunk = signal[:, s:e]
+        if chunk.shape[1] < sr * 0.3:  # skip segments shorter than 0.3s
+            embeddings.append(None)
+            continue
+        emb = classifier.encode_batch(chunk)
+        embeddings.append(emb.squeeze().cpu().numpy())
+
+    return embeddings
+
+
+def cluster_speakers(embeddings, n_clusters=None):
+    """Cluster embeddings into speakers. Auto-detect count if not specified."""
+    valid = [(i, e) for i, e in enumerate(embeddings) if e is not None]
+    if not valid:
+        return [0] * len(embeddings)
+
+    indices, embs = zip(*valid)
+    X = np.stack(embs)
+
+    if n_clusters is None:
+        # Try 2-8 speakers, pick by silhouette score
+        from sklearn.metrics import silhouette_score
+
+        best_score = -1
+        best_n = 2
+        max_n = min(8, len(X) - 1)
+        if max_n < 2:
+            labels_all = [0] * len(embeddings)
+            return labels_all
+
+        for n in range(2, max_n + 1):
+            clustering = AgglomerativeClustering(
+                n_clusters=n, metric="cosine", linkage="average"
+            )
+            labels = clustering.fit_predict(X)
+            if len(set(labels)) < 2:
+                continue
+            score = silhouette_score(X, labels, metric="cosine")
+            if score > best_score:
+                best_score = score
+                best_n = n
+
+        n_clusters = best_n
+
+    clustering = AgglomerativeClustering(
+        n_clusters=n_clusters, metric="cosine", linkage="average"
+    )
+    labels = clustering.fit_predict(X)
+
+    # Map back to full list
+    labels_all = [0] * len(embeddings)
+    for idx, label in zip(indices, labels):
+        labels_all[idx] = int(label)
+
+    return labels_all
+
+
+def format_fountain(segments, labels):
+    """Format as fountain: timestamps + speaker labels + dialogue."""
+    lines = []
+    prev_speaker = None
+
+    for (start, _end, text), label in zip(segments, labels):
+        speaker = f"SPEAKER_{label:02d}"
+
+        # Add timestamp at speaker changes or every few minutes
+        if prev_speaker != speaker:
+            h = int(start) // 3600
+            m = int(start) % 3600 // 60
+            s = int(start) % 60
+            lines.append(f"[[{h:02d}:{m:02d}:{s:02d}]]")
+            lines.append(speaker)
+            lines.append(text)
+            lines.append("")
+        else:
+            lines.append(text)
+            lines.append("")
+
+        prev_speaker = speaker
+
+    return "\n".join(lines)
+
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: diarize <audio.wav> <input.srt> <output.txt>", file=sys.stderr)
+        sys.exit(1)
+
+    audio_path = sys.argv[1]
+    srt_path = sys.argv[2]
+    output_path = sys.argv[3]
+
+    print("  loading speaker model...", file=sys.stderr)
+    classifier = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=Path.home() / ".cache" / "speechbrain" / "spkrec-ecapa-voxceleb",
+        run_opts={"device": "cpu"},
+    )
+
+    print("  parsing SRT...", file=sys.stderr)
+    segments = parse_srt(srt_path)
+    print(f"  {len(segments)} segments", file=sys.stderr)
+
+    print("  extracting speaker embeddings...", file=sys.stderr)
+    embeddings = extract_embeddings(audio_path, segments, classifier)
+
+    print("  clustering speakers...", file=sys.stderr)
+    labels = cluster_speakers(embeddings)
+    n_speakers = len(set(labels))
+    print(f"  {n_speakers} speakers detected", file=sys.stderr)
+
+    result = format_fountain(segments, labels)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(result)
+
+    print(f"  -> {output_path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

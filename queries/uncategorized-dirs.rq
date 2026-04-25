@@ -1,0 +1,23 @@
+# Directories with the most files that have no category
+# in their ancestry. Use this to find where to add
+# new lines to category-dir.csv for maximum coverage.
+#
+# Usage: curl -s http://localhost:7878/query \
+#   -H "Content-Type: application/sparql-query" \
+#   -H "Accept: text/tab-separated-values" \
+#   -d @queries/uncategorized-dirs.rq | column -t -s$'\t'
+
+PREFIX : <urn:alhidad:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?path ?label (COUNT(?file) AS ?files) WHERE {
+  ?file a :File ;
+    :directory ?dir .
+  ?dir rdfs:label ?label ;
+       :path ?path .
+  FILTER NOT EXISTS { ?dir :category ?cat }
+}
+GROUP BY ?path ?label
+ORDER BY DESC(?files)
+LIMIT 30

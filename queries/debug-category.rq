@@ -1,0 +1,14 @@
+PREFIX : <urn:alhidad:>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+# Show which directories have sound/recording and what other categories they also have
+SELECT ?dirPath ?catLabel WHERE {
+  ?dir :category ?cat .
+  ?cat skos:prefLabel "sound/recording" .
+  ?dir :path ?dirPath .
+  ?dir :category ?otherCat .
+  ?otherCat skos:prefLabel ?catLabel .
+}
+ORDER BY ?dirPath
+LIMIT 50

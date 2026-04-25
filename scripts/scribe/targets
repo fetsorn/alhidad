@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0
+# List untranscribed files for a given category.
+# Queries the graph, diffs against existing prose/, outputs paths newest-first.
+#
+# Usage: targets [--category sound/recording] [--limit N] [--backend arq|oxi]
+#
+# Expects GRAPH and PROSE environment variables.
+set -euo pipefail
+
+ALHIDAD="$(cd "$(dirname "$0")/../.." && pwd)"
+ALL_TTL="${GRAPH:?GRAPH not set}/estate.ttl"
+OXI_QUERY="http://localhost:7878/query"
+CATEGORY="sound/recording"
+LIMIT=""
+BACKEND="arq"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --category) CATEGORY="$2"; shift 2 ;;
+        --limit) LIMIT="$2"; shift 2 ;;
+        --backend) BACKEND="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Substitute $CATEGORY in query template, write to temp file
+QUERY_TEMPLATE="${ALHIDAD}/queries/by-category.rq"
+TMPQUERY="$(mktemp --suffix=.rq)"
+trap 'rm -f "$TMPQUERY"' EXIT
+sed "s|\$CATEGORY|${CATEGORY}|g" "$QUERY_TEMPLATE" > "$TMPQUERY"
+
+# Run query, skip header, extract paths
+case "$BACKEND" in
+    arq)
+        RAW=$(nix-shell -p apache-jena --command "arq --query $TMPQUERY --data $ALL_TTL --results=TSV")
+        ;;
+    oxi)
+        RAW=$(curl -s "$OXI_QUERY" -H "Content-Type: application/sparql-query" -H "Accept: text/tab-separated-values" --data-binary "@$TMPQUERY")
+        ;;
+    *)
+        echo "Unknown backend: $BACKEND (use arq or oxi)" >&2; exit 1
+        ;;
+esac
+PATHS=$(echo "$RAW" | tail -n +2 | sed 's/^"//;s/"$//')
+
+# Filter out already transcribed, apply limit
+COUNT=0
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if [ ! -f "${PROSE:?PROSE not set}/${p}.txt" ]; then
+        echo "$p"
+        COUNT=$((COUNT + 1))
+        if [ -n "$LIMIT" ] && [ "$COUNT" -ge "$LIMIT" ]; then
+            break
+        fi
+    fi
+done <<< "$PATHS"
