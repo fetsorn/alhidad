@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0
+# Continuous transcription with thermal throttling.
+# Runs batches of transcribe-one, pausing when the machine overheats.
+# Thermal checks happen both between files AND between chunks within a file.
+#
+# Usage: scribe-cool [options]
+#   All options are passed through env vars (set by Makefile):
+#     ARCHIVE, PROSE, MODEL, WHISPER, CATEGORY, LIMIT, BACKEND
+#   Thermal tuning (env):
+#     TEMP_SENSOR   - hwmon path (default: auto-detect macsmc WiFi sensor)
+#     TEMP_CEIL     - pause above this temp in millidegrees (default: 70000 = 70C)
+#     TEMP_FLOOR    - resume below this temp in millidegrees (default: 55000 = 55C)
+#     COOL_INTERVAL - seconds between temp checks while cooling (default: 30)
+set -euo pipefail
+
+SCRIBE="$(cd "$(dirname "$0")" && pwd)"
+
+# Source and init thermal throttling
+source "$SCRIBE/thermal"
+thermal_init
+export TEMP_SENSOR TEMP_CEIL TEMP_FLOOR COOL_INTERVAL
+
+# --- transcription config (from env / Makefile) ---
+ARCHIVE="${ARCHIVE:?ARCHIVE not set}"
+PROSE="${PROSE:?PROSE not set}"
+MODEL="${MODEL:?MODEL not set}"
+WHISPER="${WHISPER:?WHISPER not set}"
+CATEGORY="${CATEGORY:-sound/recording}"
+LIMIT="${LIMIT:-1}"
+BACKEND="${BACKEND:-arq}"
+
+TOTAL=0
+
+echo "scribe-cool: sensor=$TEMP_SENSOR ceil=$(_thermal_fmt "$TEMP_CEIL") floor=$(_thermal_fmt "$TEMP_FLOOR")" >&2
+
+while true; do
+    # Get next batch of targets
+    mapfile -t TARGETS < <("$SCRIBE/targets" \
+        --category "$CATEGORY" \
+        --backend "$BACKEND" \
+        --limit "$LIMIT")
+
+    if [ "${#TARGETS[@]}" -eq 0 ] || [ -z "${TARGETS[0]}" ]; then
+        echo "scribe-cool: no more targets. $TOTAL files transcribed." >&2
+        break
+    fi
+
+    echo "scribe-cool: batch of ${#TARGETS[@]} targets" >&2
+
+    for p in "${TARGETS[@]}"; do
+        [ -z "$p" ] && continue
+
+        # Check temperature before each file
+        wait_cool
+
+        echo "scribe-cool: [$((TOTAL + 1))] $p" >&2
+        if "$SCRIBE/transcribe-one" "$ARCHIVE/$p" "$PROSE/$p.txt" "$MODEL" "$WHISPER"; then
+            TOTAL=$((TOTAL + 1))
+        else
+            echo "scribe-cool: FAILED $p (exit $?), continuing..." >&2
+            TOTAL=$((TOTAL + 1))
+        fi
+    done
+done
+
+echo "scribe-cool: done. $TOTAL files total." >&2

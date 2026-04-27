@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0
+# Thermal throttling helpers. Source this file; it defines wait_cool().
+#
+# Env vars (all optional — if TEMP_SENSOR is empty, wait_cool is a no-op):
+#   TEMP_SENSOR   - hwmon path to read millidegree temp from
+#   TEMP_CEIL     - pause above this (millidegrees, default 70000 = 70C)
+#   TEMP_FLOOR    - resume below this (millidegrees, default 55000 = 55C)
+#   COOL_INTERVAL - seconds between polls while cooling (default 30)
+
+TEMP_SENSOR="${TEMP_SENSOR:-}"
+TEMP_CEIL="${TEMP_CEIL:-50000}"
+TEMP_FLOOR="${TEMP_FLOOR:-45000}"
+COOL_INTERVAL="${COOL_INTERVAL:-30}"
+
+_thermal_read() {
+    if [ -n "$TEMP_SENSOR" ] && [ -f "$TEMP_SENSOR" ]; then
+        cat "$TEMP_SENSOR"
+    else
+        echo "0"
+    fi
+}
+
+_thermal_fmt() {
+    python3 -c "print(f'{$1/1000:.1f}C')"
+}
+
+# Auto-detect sensor if not set. Call once at startup.
+thermal_init() {
+    if [ -n "$TEMP_SENSOR" ]; then
+        return
+    fi
+    # Prefer macsmc WiFi/BT module (good SoC proxy on Asahi Apple Silicon)
+    for f in /sys/class/hwmon/hwmon*/temp*_input; do
+        [ -f "$f" ] || continue
+        local label name
+        label=$(cat "${f%_input}_label" 2>/dev/null || true)
+        name=$(cat "$(dirname "$f")/name" 2>/dev/null || true)
+        if [[ "$name" == "macsmc_hwmon" && "$label" == *"WiFi"* ]]; then
+            TEMP_SENSOR="$f"
+            return
+        fi
+    done
+    # Fallback: first hwmon temp
+    TEMP_SENSOR=$(ls /sys/class/hwmon/hwmon*/temp1_input 2>/dev/null | head -1 || true)
+}
+
+# Block until temperature is below TEMP_FLOOR (or no-op if no sensor).
+wait_cool() {
+    [ -n "$TEMP_SENSOR" ] || return 0
+    local temp
+    temp=$(_thermal_read)
+    if [ "$temp" -gt "$TEMP_CEIL" ]; then
+        echo "  HOT $(_thermal_fmt "$temp") > $(_thermal_fmt "$TEMP_CEIL"), pausing..." >&2
+        while true; do
+            sleep "$COOL_INTERVAL"
+            temp=$(_thermal_read)
+            echo "  ... $(_thermal_fmt "$temp")" >&2
+            if [ "$temp" -le "$TEMP_FLOOR" ]; then
+                echo "  COOL $(_thermal_fmt "$temp") <= $(_thermal_fmt "$TEMP_FLOOR"), resuming" >&2
+                break
+            fi
+        done
+    fi
+}

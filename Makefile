@@ -38,7 +38,7 @@ DATA_PATH   := $(CSVS)/data-file.csv
 DIR_PARENT  := $(CSVS)/dir-parent.csv
 CAT_PATH    := $(CSVS)/category-dir.csv
 
-.PHONY: all load clean segments list scribe
+.PHONY: all load clean segments list scribe scribe-cool
 
 all: $(ALL_TTL)
 
@@ -94,6 +94,12 @@ scribe:
 	| while IFS= read -r p; do \
 		$(SCRIBE)/transcribe-one "$(ARCHIVE)/$$p" "${PROSE}/$$p.txt" "$(MODEL)" "$(WHISPER)"; \
 	done
+
+# Continuous transcription with thermal throttling
+scribe-cool:
+	@ARCHIVE="$(ARCHIVE)" PROSE="$(PROSE)" MODEL="$(MODEL)" WHISPER="$(WHISPER)" \
+		CATEGORY="$(CATEGORY)" LIMIT="$(LIMIT)" BACKEND="$(BACKEND)" \
+		$(SCRIBE)/scribe-cool
 
 # Show what would be transcribed
 list:

@@ -47,39 +47,67 @@ def parse_srt(path):
     return segments
 
 
-def extract_embeddings(audio_path, segments, classifier):
-    """Extract speaker embedding for each segment."""
-    # torchcodec fails with libnppicc.so.13 no such file
-    #signal, sr = torchaudio.load(audio_path, backend="sox")
-    data, sr = librosa.load(audio_path)
-    signal = torch.from_numpy(data)
+def extract_embeddings(audio_path, segments, classifier, batch_size=500):
+    """Extract speaker embedding for each segment in batches to limit memory."""
+    import gc
+    import soundfile as sf
 
-    if signal.ndim == 1:
-        signal = signal.unsqueeze(0) # Becomes [1, samples]
-    else:
-        signal = signal.t() # If already 2D, ensure it's [channels, samples]
+    info = sf.info(audio_path)
+    sr = info.samplerate
+    total_frames = info.frames
 
     if sr != 16000:
-        #signal = torchaudio.functional.resample(signal, sr, 16000)
-        signal = librosa.resample(signal.numpy(), orig_sr=sr, target_sr=16000)
-        signal = torch.from_numpy(signal)
-        if signal.ndim == 1:
-            signal = signal.unsqueeze(0)
+        # fallback: load and resample entire file
+        data, sr = librosa.load(audio_path, sr=16000, mono=True)
+        signal_np = data
         sr = 16000
-    # Mono
-    if signal.shape[0] > 1:
-        signal = signal.mean(dim=0, keepdim=True)
+    else:
+        data, _ = sf.read(audio_path, dtype="float32", always_2d=True)
+        # mono
+        signal_np = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
 
+    emb_dim = 192  # ECAPA-TDNN output dimension
+    n = len(segments)
+    # pre-allocate result array on disk via memmap to avoid RAM spike
+    emb_path = Path(audio_path).parent / ".embeddings.npy"
+    all_emb = np.memmap(emb_path, dtype="float32", mode="w+", shape=(n, emb_dim))
+    valid_mask = np.zeros(n, dtype=bool)
+
+    for batch_start in range(0, n, batch_size):
+        batch_end = min(batch_start + batch_size, n)
+        print(f"  embeddings {batch_start+1}-{batch_end}/{n}...", file=sys.stderr)
+
+        for i in range(batch_start, batch_end):
+            start, end, _text = segments[i]
+            s = int(start * sr)
+            e = int(end * sr)
+            if e - s < int(sr * 0.3):
+                continue
+            chunk = torch.from_numpy(signal_np[s:e]).unsqueeze(0)
+            emb = classifier.encode_batch(chunk)
+            all_emb[i] = emb.squeeze().cpu().numpy()
+            valid_mask[i] = True
+            del chunk, emb
+
+        all_emb.flush()
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Convert to list format expected by cluster_speakers
     embeddings = []
-    for start, end, _text in segments:
-        s = int(start * sr)
-        e = int(end * sr)
-        chunk = signal[:, s:e]
-        if chunk.shape[1] < sr * 0.3:  # skip segments shorter than 0.3s
+    for i in range(n):
+        if valid_mask[i]:
+            embeddings.append(np.array(all_emb[i]))
+        else:
             embeddings.append(None)
-            continue
-        emb = classifier.encode_batch(chunk)
-        embeddings.append(emb.squeeze().cpu().numpy())
+
+    del all_emb, signal_np
+    gc.collect()
+    # clean up temp file
+    try:
+        emb_path.unlink()
+    except OSError:
+        pass
 
     return embeddings
 
