@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0
+# Transcribe files from a sha256sum listing, bypassing the graph.
+# Usage: scribe-listing <listing> <archive_root> <prose_dir> <model> <whisper>
+set -euo pipefail
+
+LISTING="$1"
+ROOT="$2"
+PROSE="$3"
+MODEL="$4"
+WHISPER="$5"
+SCRIBE="$(cd "$(dirname "$0")" && pwd)"
+
+source "$SCRIBE/thermal"
+thermal_init
+export TEMP_SENSOR TEMP_CEIL TEMP_FLOOR COOL_INTERVAL
+
+echo "scribe-listing: sensor=$TEMP_SENSOR ceil=$(_thermal_fmt "$TEMP_CEIL") floor=$(_thermal_fmt "$TEMP_FLOOR")" >&2
+
+TOTAL=0
+SKIPPED=0
+
+while IFS='  ' read -r hash path; do
+  [ -z "$hash" ] && continue
+  OUTFILE="$PROSE/$path.txt"
+  if [ -f "$OUTFILE" ]; then
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+  wait_cool
+  TOTAL=$((TOTAL + 1))
+  echo "scribe-listing: [$TOTAL] $path" >&2
+  if "$SCRIBE/transcribe-one" "$ROOT/$path" "$OUTFILE" "$MODEL" "$WHISPER"; then
+    :
+  else
+    echo "scribe-listing: FAILED $path (exit $?), continuing..." >&2
+  fi
+done < "$LISTING"
+
+echo "scribe-listing: done. $TOTAL transcribed, $SKIPPED skipped." >&2

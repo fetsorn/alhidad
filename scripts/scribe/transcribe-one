@@ -136,12 +136,13 @@ if [ "$DONE_COUNT" -lt "$SEG_TOTAL" ]; then
         ffmpeg -y -i "$AUDIO" -ss "$SEG_START" -t "$SEG_DUR" -c:a pcm_s16le "$SEG_AUDIO" 2>/dev/null
 
         # Transcribe chunk to SRT
+        # max-content helps when whisper goes into a loop
+        # https://github.com/ggml-org/whisper.cpp/issues/508
         SEG_BASE="$WORKDIR/seg_out"
         "$WHISPER" \
             -m "$MODEL" \
             -l auto \
             --output-srt \
-            --max-context 0 \
             --output-file "$SEG_BASE" \
             -f "$SEG_AUDIO" 2>/dev/null || true
 

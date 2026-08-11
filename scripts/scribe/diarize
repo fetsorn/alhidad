@@ -19,6 +19,37 @@ from speechbrain.inference.speaker import EncoderClassifier
 from sklearn.cluster import AgglomerativeClustering
 
 
+def wait_cool():
+    """Block until temperature drops below TEMP_FLOOR. No-op if TEMP_SENSOR unset."""
+    import os, time
+
+    sensor = os.environ.get("TEMP_SENSOR", "")
+    if not sensor or not os.path.isfile(sensor):
+        return
+
+    ceil = int(os.environ.get("TEMP_CEIL", "70000"))
+    floor = int(os.environ.get("TEMP_FLOOR", "55000"))
+    interval = int(os.environ.get("COOL_INTERVAL", "30"))
+
+    try:
+        temp = int(open(sensor).read().strip())
+    except (OSError, ValueError):
+        return
+
+    if temp > ceil:
+        print(f"  HOT {temp/1000:.1f}C > {ceil/1000:.1f}C, pausing...", file=sys.stderr)
+        while True:
+            time.sleep(interval)
+            try:
+                temp = int(open(sensor).read().strip())
+            except (OSError, ValueError):
+                break
+            print(f"  ... {temp/1000:.1f}C", file=sys.stderr)
+            if temp <= floor:
+                print(f"  COOL {temp/1000:.1f}C <= {floor/1000:.1f}C, resuming", file=sys.stderr)
+                break
+
+
 def parse_srt(path):
     """Parse SRT file into list of (start_sec, end_sec, text) tuples."""
     segments = []
@@ -75,6 +106,10 @@ def extract_embeddings(audio_path, segments, classifier, batch_size=500):
 
     for batch_start in range(0, n, batch_size):
         batch_end = min(batch_start + batch_size, n)
+
+        # Thermal check between batches
+        wait_cool()
+
         print(f"  embeddings {batch_start+1}-{batch_end}/{n}...", file=sys.stderr)
 
         for i in range(batch_start, batch_end):

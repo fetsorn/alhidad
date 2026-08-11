@@ -1,6 +1,14 @@
-# Alhidad
+<div align="center">
 
-Alhidad turns a hard drive into plain text you can search, query, and read.
+part of the [ontonomy](https://norcivilianlabs.org) software suite
+
+AGPL-3.0. Anton Davydov.
+
+</div>
+
+# alhidad
+
+Turns a hard drive into plain text you can search, query, and read.
 
 You point it at a drive full of files. It builds a metadata dataset in [CSVS](https://norcivilianlabs.org/csvs/specs/comma_separated_value_store.html) - plain text, two-column CSV files you can open in any editor. It converts that dataset to [TTL](https://www.w3.org/TR/turtle/) so you can query it with SPARQL. Then it finds audio and video files and transcribes them into [Fountain](https://fountain.io/) screenplays - speaker labels, timestamps, plain text.
 
@@ -114,10 +122,7 @@ The reasoning behind each design choice is documented as [MADRs](https://adr.git
 
 Early and opinionated. The Python scripts are provisional - CSVS-to-TTL conversion and filesystem ingestion will eventually be handled by [panrec](https://codeberg.org/norcivilianlabs/panrec). Transcription scripts will mature into an independent tool. What remains in alhidad is the Makefile, the schema conventions, the SPARQL queries, and the documentation of why things are the way they are.
 
-## Contact
+## Source
 
-Questions, ideas, or patches: fetsorn@gmail.com
-
-## License
-
-AGPL-3.0
+- Codeberg: [norcivilianlabs/alhidad](https://codeberg.org/norcivilianlabs/alhidad)
+- GitHub: [fetsorn/alhidad](https://github.com/fetsorn/alhidad)
